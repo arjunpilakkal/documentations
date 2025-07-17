@@ -1,0 +1,158 @@
+# Jenkins + SonarQube Integration with Blue Ocean Visualization (Step-by-Step)
+
+## Step 1: Use Red Hat 9
+
+* Launch EC2 instance using **Red Hat Enterprise Linux 9 (x86\_64)**.
+* Choose region: **US East (N. Virginia)**.
+* Use instance type: **t3.large** (recommended for SonarQube performance).
+* Open ports **8080** (Jenkins) and **9000** (SonarQube) in the **security group**.
+
+## Step 2: Setup Jenkins Server
+
+* Ensure Jenkins is installed and running on the Red Hat 9 EC2 instance.
+* Open Jenkins at `http://<Jenkins-IP>:8080`
+
+## Step 3: Install Required Jenkins Plugins
+
+From **Manage Jenkins → Plugin Manager → Available**:
+
+* Install:
+
+  * **Blue Ocean**
+  * **Pipeline**
+  * **SonarQube Scanner**
+  * **Git**
+  * **GitHub Integration** (if applicable)
+
+## Step 4: Setup SonarQube on a Separate EC2 Instance
+
+* Launch a **separate EC2 instance** for SonarQube.
+* Use **Red Hat 9**, **t3.large**.
+* Open **port 9000**.
+
+### A. Install Java 17
+
+```bash
+sudo yum install java-17-openjdk -y
+```
+
+### B. Download and Extract SonarQube
+
+```bash
+cd /opt
+sudo wget https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-10.5.1.90531.zip
+sudo unzip sonarqube-10.5.1.90531.zip
+sudo mv sonarqube-10.5.1.90531 sonarqube
+sudo useradd sonar
+sudo chown -R sonar:sonar /opt/sonarqube
+```
+
+### C. Setup PostgreSQL
+
+```bash
+sudo yum install postgresql-server postgresql-contrib -y
+sudo postgresql-setup --initdb
+sudo systemctl enable postgresql --now
+```
+
+Login to psql:
+
+```bash
+sudo -i -u postgres
+psql
+CREATE DATABASE sonarqube;
+CREATE USER sonar WITH ENCRYPTED PASSWORD 'sonar@123';
+GRANT ALL PRIVILEGES ON DATABASE sonarqube TO sonar;
+ALTER DATABASE sonarqube OWNER TO sonar;
+GRANT ALL ON SCHEMA public TO sonar;
+\q
+exit
+```
+
+### D. Configure SonarQube with PostgreSQL
+
+Edit `/opt/sonarqube/conf/sonar.properties`:
+
+```properties
+sonar.jdbc.username=sonar
+sonar.jdbc.password=sonar@123
+sonar.jdbc.url=jdbc:postgresql://localhost/sonarqube
+```
+
+### E. Start SonarQube
+
+```bash
+sudo su - sonar
+cd /opt/sonarqube/bin/linux-x86-64
+./sonar.sh start
+```
+
+If SonarQube fails to start, check logs:
+
+```bash
+tail -f /opt/sonarqube/logs/web.log
+```
+
+Ensure `GRANT ALL ON SCHEMA public TO sonar;` was executed correctly if errors appear.
+
+### F. Access SonarQube UI
+
+Visit `http://<SonarQube-IP>:9000`
+Default login: `admin` / `admin`
+
+## Step 5: Configure SonarQube in Jenkins
+
+* Go to **Manage Jenkins → Configure System**
+* Under **SonarQube servers**:
+
+  * Name: `MySonarQube`
+  * Server URL: `http://<SonarQube-IP>:9000`
+  * Add secret token generated from SonarQube UI under **My Account → Security**
+
+## Step 6: Create Jenkins Pipeline with Blue Ocean
+
+### A. Access Blue Ocean
+
+* Jenkins Dashboard → Open Blue Ocean
+* Choose source control repo (GitHub or Git)
+* Jenkins will look for `Jenkinsfile`
+
+### B. Sample `Jenkinsfile`
+
+```groovy
+pipeline {
+    agent any
+    tools {
+        maven 'Maven 3.9.6' // Make sure it's defined in Jenkins tools
+    }
+    environment {
+        SONARQUBE = 'MySonarQube'
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        stage('Build') {
+            steps {
+                sh 'mvn clean install'
+            }
+        }
+        stage('Code Quality - SonarQube') {
+            steps {
+                withSonarQubeEnv("${SONARQUBE}") {
+                    sh 'mvn sonar:sonar'
+                }
+            }
+        }
+    }
+}
+```
+
+## Step 7: Monitor
+
+* Use Blue Ocean to visualize pipeline.
+* Use SonarQube dashboard to track code smells, bugs, coverage, etc.
+
+---
