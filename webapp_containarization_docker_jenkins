@@ -1,0 +1,192 @@
+# Jenkins + Docker Deployment Guide
+
+This guide explains how to deploy a sample Java application using **Docker** and **Jenkins**. It covers the installation of prerequisites, setting up a GitHub repository, creating a Docker image, pushing it to Docker Hub, and running it inside a container using Jenkins automation.
+
+---
+
+## 🚀 Prerequisites
+
+Ensure you have the following installed on your **Ubuntu server(s):**
+
+### 1. Update System
+```bash
+sudo apt update && sudo apt upgrade -y
+```
+
+### 2. Install Git
+```bash
+sudo apt install git -y
+```
+
+### 3. Install Docker
+```bash
+sudo apt install docker.io -y
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker $USER
+```
+*(Log out and log back in to apply group changes.)*
+
+Verify installation:
+```bash
+docker --version
+```
+
+### 4. Install Jenkins
+```bash
+sudo apt install openjdk-11-jdk -y
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io.key | sudo tee \
+  /usr/share/keyrings/jenkins-keyring.asc > /dev/null
+echo deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
+  https://pkg.jenkins.io/debian-stable binary/ | sudo tee \
+  /etc/apt/sources.list.d/jenkins.list > /dev/null
+
+sudo apt update
+sudo apt install jenkins -y
+sudo systemctl start jenkins
+sudo systemctl enable jenkins
+```
+
+Access Jenkins at: `http://<your-server-ip>:8080`
+
+---
+
+## 📂 Project Setup
+
+### 1. Fork Sample Repository
+Find a simple Java application on GitHub (for example: [sample-java-application](https://github.com/arjunpilakkal/sample-java-application)) and **fork it** into your own GitHub account.
+
+Clone it locally:
+```bash
+git clone https://github.com/<your-username>/<your-forked-repo>.git
+cd <your-forked-repo>
+```
+
+### 2. Create Dockerfile
+Inside your project folder, create a file named `Dockerfile`:
+
+```dockerfile
+FROM openjdk:11-jre-slim
+
+WORKDIR /app
+COPY target/*.war /app/app.war
+
+EXPOSE 8080
+CMD ["java", "-jar", "app.war"]
+```
+
+Build and test locally:
+```bash
+docker build -t my-sample-app:1.0 .
+docker run -d -p 8080:8080 my-sample-app:1.0
+```
+Check at: `http://<your-server-ip>:8080`
+
+---
+
+## 🐳 Push Image to Docker Hub
+
+1. Log in to Docker Hub:
+```bash
+docker login
+```
+
+2. Tag and push:
+```bash
+docker tag my-sample-app:1.0 <your-dockerhub-username>/sample-app:latest
+docker push <your-dockerhub-username>/sample-app:latest
+```
+
+---
+
+## ⚙️ Jenkins Pipeline Setup
+
+1. In Jenkins, install required plugins:
+   - **Pipeline**
+   - **Docker Pipeline**
+   - **Git**
+
+2. Create a new **Pipeline Job** in Jenkins.
+
+3. Add your GitHub repo URL.
+
+4. In your repo, create a file named `Jenkinsfile`:
+
+```groovy
+pipeline {
+    agent any
+
+    environment {
+        DOCKERHUB_CREDENTIALS = credentials('dockerhub-creds')
+    }
+
+    stages {
+        stage('Clone Repo') {
+            steps {
+                git 'https://github.com/<your-username>/<your-forked-repo>.git'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build -t <your-dockerhub-username>/sample-app:latest .'
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                    sh 'echo $PASS | docker login -u $USER --password-stdin'
+                    sh 'docker push <your-dockerhub-username>/sample-app:latest'
+                }
+            }
+        }
+
+        stage('Run Container') {
+            steps {
+                sh 'docker stop sample-app || true && docker rm sample-app || true'
+                sh 'docker run -d --name sample-app -p 9090:8080 <your-dockerhub-username>/sample-app:latest'
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker logout'
+        }
+    }
+}
+```
+
+*(Replace `<your-username>` and `<your-dockerhub-username>` with your actual values.)*
+
+---
+
+## ✅ Verification
+
+1. Trigger the Jenkins job manually.
+2. Jenkins will:
+   - Clone the repo
+   - Build Docker image
+   - Push image to Docker Hub
+   - Run container
+3. Visit: `http://<your-server-ip>:9090`
+
+You should see the Java application running! 🎉
+
+---
+
+## 📌 Summary
+- Installed Git, Docker, Jenkins.
+- Forked a sample Java project.
+- Wrote a Dockerfile and tested locally.
+- Pushed Docker image to Docker Hub.
+- Automated everything via Jenkins pipeline.
+- Verified application running on port `9090`.
+
+---
+
+### 🔗 References
+- [Docker Docs](https://docs.docker.com/)
+- [Jenkins Docs](https://www.jenkins.io/doc/)
+- [Sample Java Application](https://github.com/arjunpilakkal/sample-java-application)
