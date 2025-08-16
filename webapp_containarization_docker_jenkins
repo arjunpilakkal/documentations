@@ -1,192 +1,344 @@
-# Jenkins + Docker Deployment Guide
+# Jenkins + Docker Deployment Guide (for `sample-java-application`)
 
-This guide explains how to deploy a sample Java application using **Docker** and **Jenkins**. It covers the installation of prerequisites, setting up a GitHub repository, creating a Docker image, pushing it to Docker Hub, and running it inside a container using Jenkins automation.
+This guide walks you through a complete CI/CD setup to build and deploy a Java web app (WAR) to **Tomcat** inside Docker using **Jenkins**. It includes:
+
+- Installing **Git**, **Docker**, **Jenkins** and dependencies on Ubuntu
+- Forking the reference app and creating **your own** GitHub repo
+- Writing a **Dockerfile** (Ubuntu + Tomcat)
+- Creating a **Jenkins Pipeline** (`Jenkinsfile`) that builds, pushes, and runs the container
+- **Jenkins UI** configuration: plugins & credentials
+- **Troubleshooting** common errors (permissions, ports, credentials, downloads, etc.)
 
 ---
 
-## 🚀 Prerequisites
+## 🔭 What you’ll build
+**Flow:** GitHub (your fork) → Jenkins (build WAR + image) → Docker Hub (push) → Jenkins host (run) → Browser access
 
-Ensure you have the following installed on your **Ubuntu server(s):**
+- Final app URL: `http://<jenkins-host-ip>:9090/app` (or your app context)
 
-### 1. Update System
+---
+
+## ✅ Prerequisites
+- **Ubuntu 22.04 LTS** VM (AWS EC2 or local) with **2 vCPU / 4GB RAM** minimum
+- GitHub & Docker Hub accounts
+- Open inbound security group/firewall for **TCP 8080 (Jenkins UI)** and **TCP 9090 (your app)**
+
+> If Jenkins runs on a different VM from Docker, repeat the Docker install on that VM too. Easiest path: **run Jenkins and Docker on the same host.**
+
+---
+
+## 1) System setup on Ubuntu
+
+### 1.1 Install Git
 ```bash
-sudo apt update && sudo apt upgrade -y
-```
-
-### 2. Install Git
-```bash
-sudo apt install git -y
-```
-
-### 3. Install Docker
-```bash
-sudo apt install docker.io -y
-sudo systemctl start docker
-sudo systemctl enable docker
-sudo usermod -aG docker $USER
-```
-*(Log out and log back in to apply group changes.)*
-
-Verify installation:
-```bash
-docker --version
-```
-
-### 4. Install Jenkins
-```bash
-sudo apt install openjdk-11-jdk -y
-curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io.key | sudo tee \
-  /usr/share/keyrings/jenkins-keyring.asc > /dev/null
-echo deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
-  https://pkg.jenkins.io/debian-stable binary/ | sudo tee \
-  /etc/apt/sources.list.d/jenkins.list > /dev/null
-
 sudo apt update
-sudo apt install jenkins -y
-sudo systemctl start jenkins
-sudo systemctl enable jenkins
+sudo apt install -y git
+git --version
 ```
 
-Access Jenkins at: `http://<your-server-ip>:8080`
+### 1.2 Install Docker (Engine + CLI)
+```bash
+# Prereqs
+sudo apt-get install -y ca-certificates curl gnupg lsb-release
+
+# Docker’s official GPG key
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+# Stable repo
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Install
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Enable service
+sudo systemctl enable --now docker
+
+# Allow your user and the Jenkins user to run docker
+sudo usermod -aG docker $USER
+sudo usermod -aG docker jenkins || true
+
+# Apply group changes for current shell
+newgrp docker
+
+# Test
+docker run --rm hello-world
+```
+
+### 1.3 Install Jenkins (LTS)
+```bash
+# Java (Jenkins supports Java 11 or 17; we use 11 here)
+sudo apt install -y openjdk-11-jdk
+
+# Jenkins repo + key
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | sudo tee /usr/share/keyrings/jenkins-keyring.asc > /dev/null
+echo deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/ | sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
+
+# Install Jenkins
+sudo apt update
+sudo apt install -y jenkins
+sudo systemctl enable --now jenkins
+
+# Get initial admin password
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+```
+Open the UI at: `http://<server-ip>:8080` → **Unlock Jenkins** → **Install suggested plugins**.
+
+> **Important:** After adding `jenkins` to the `docker` group above, restart Jenkins so it picks up the new group membership:
+```bash
+sudo systemctl restart jenkins
+```
 
 ---
 
-## 📂 Project Setup
+## 2) Prepare your application repository
 
-### 1. Fork Sample Repository
-Find a simple Java application on GitHub (for example: [sample-java-application](https://github.com/arjunpilakkal/sample-java-application)) and **fork it** into your own GitHub account.
+### 2.1 Fork the sample app
+1. Open: `https://github.com/arjunpilakkal/sample-java-application`
+2. Click **Fork** → your GitHub account.
+3. Your fork URL will look like: `https://github.com/<your-username>/sample-java-application`
 
-Clone it locally:
+### 2.2 Clone your fork to a workstation (or the Jenkins host)
 ```bash
-git clone https://github.com/<your-username>/<your-forked-repo>.git
-cd <your-forked-repo>
+git clone https://github.com/<your-username>/sample-java-application.git
+cd sample-java-application
 ```
 
-### 2. Create Dockerfile
-Inside your project folder, create a file named `Dockerfile`:
+### 2.3 (Optional) Verify you can build a WAR locally
+This repo typically contains a Maven Wrapper (`mvnw`). If not, use `mvn` (install Maven with `sudo apt install -y maven`).
+```bash
+# with wrapper
+chmod +x mvnw
+./mvnw clean package -DskipTests
 
+# or with system Maven
+mvn clean package -DskipTests
+
+ls -lh target/*.war
+```
+
+---
+
+## 3) Add a Dockerfile (Ubuntu + Tomcat)
+Create `Dockerfile` in the repo root:
 ```dockerfile
-FROM openjdk:11-jre-slim
+# Base Ubuntu and Java
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
 
-WORKDIR /app
-COPY target/*.war /app/app.war
+RUN apt-get update \
+ && apt-get install -y openjdk-11-jdk wget \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install Apache Tomcat (pin a current version)
+RUN wget https://dlcdn.apache.org/tomcat/tomcat-9/v9.0.108/bin/apache-tomcat-9.0.108.tar.gz \
+ && tar xzf apache-tomcat-9.0.108.tar.gz \
+ && mv apache-tomcat-9.0.108 /opt/tomcat \
+ && rm apache-tomcat-9.0.108.tar.gz
+
+# Copy the built WAR into Tomcat
+# If your artifact name differs, adjust the pattern below
+COPY target/*.war /opt/tomcat/webapps/app.war
 
 EXPOSE 8080
-CMD ["java", "-jar", "app.war"]
+CMD ["/opt/tomcat/bin/catalina.sh", "run"]
 ```
-
-Build and test locally:
-```bash
-docker build -t my-sample-app:1.0 .
-docker run -d -p 8080:8080 my-sample-app:1.0
+(Optional) `.dockerignore`:
 ```
-Check at: `http://<your-server-ip>:8080`
+.git
+.gitignore
+*.md
+*.log
+node_modules/
+target/
+```
+Commit and push this to **your fork**.
 
 ---
 
-## 🐳 Push Image to Docker Hub
+## 4) Jenkins UI configuration (plugins & credentials)
 
-1. Log in to Docker Hub:
+### 4.1 Install required plugins
+Jenkins → **Manage Jenkins** → **Plugins** → **Available** tab → install:
+- **Pipeline** (Declarative + Groovy pipeline support)
+- **Git** (SCM)
+- **Credentials Binding** (safe secret injection)
+- **Docker Pipeline** (optional, but helpful)
+- *(Optional)* **Timestamper**, **AnsiColor**, **Workspace Cleanup**, **Blue Ocean**
+
+Restart Jenkins if prompted.
+
+### 4.2 Add credentials (Docker Hub, optional GitHub)
+Jenkins → **Manage Jenkins** → **Credentials** → **System** → **Global credentials (unrestricted)** → **Add Credentials**:
+
+**A) Docker Hub**
+- **Kind:** Username with password  
+- **ID:** `dockerhub` *(use exactly this ID to match the Jenkinsfile below)*  
+- **Username:** `<your-dockerhub-username>`  
+- **Password:** *(Docker Hub access token with **Read & Write** access)*  
+
+**B) GitHub (optional, only if your fork is private)**
+- **Kind:** Username with password (or **Secret text** for a PAT)  
+- **ID:** `github`  
+- **Username:** `<your-github-username>`  
+- **Password/Token:** `<your-PAT-with-repo-scope>`
+
+### 4.3 Verify Docker access from Jenkins
+Create a **Freestyle** job → **Build step: Execute shell**:
 ```bash
-docker login
+docker --version
+id
 ```
-
-2. Tag and push:
+Run the job — it should succeed and show Docker version. If you see `permission denied` on `/var/run/docker.sock`, re-run:
 ```bash
-docker tag my-sample-app:1.0 <your-dockerhub-username>/sample-app:latest
-docker push <your-dockerhub-username>/sample-app:latest
+sudo usermod -aG docker jenkins
+sudo systemctl restart jenkins
 ```
 
 ---
 
-## ⚙️ Jenkins Pipeline Setup
-
-1. In Jenkins, install required plugins:
-   - **Pipeline**
-   - **Docker Pipeline**
-   - **Git**
-
-2. Create a new **Pipeline Job** in Jenkins.
-
-3. Add your GitHub repo URL.
-
-4. In your repo, create a file named `Jenkinsfile`:
+## 5) Jenkins Pipeline (`Jenkinsfile`)
+Create `Jenkinsfile` in your repo root and push it. The pipeline will:
+1) Clone your fork  
+2) Build the WAR  
+3) Build & push Docker image to Docker Hub  
+4) Run the container on port **9090** (to avoid clashing with Jenkins 8080)
 
 ```groovy
 pipeline {
-    agent any
+  agent any
 
-    environment {
-        DOCKERHUB_CREDENTIALS = credentials('dockerhub-creds')
+  environment {
+    DOCKERHUB_USER = '<your-dockerhub-username>'   // change this
+    IMAGE_NAME     = 'sample-java-application'
+    IMAGE_TAG      = 'latest'
+  }
+
+  options { timestamps() }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        // If your fork is private, add credentials: credentialsId: 'github'
+        git branch: 'main', url: 'https://github.com/<your-username>/sample-java-application.git'
+      }
     }
 
-    stages {
-        stage('Clone Repo') {
-            steps {
-                git 'https://github.com/<your-username>/<your-forked-repo>.git'
-            }
-        }
-
-        stage('Build Docker Image') {
-            steps {
-                sh 'docker build -t <your-dockerhub-username>/sample-app:latest .'
-            }
-        }
-
-        stage('Push to Docker Hub') {
-            steps {
-                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
-                    sh 'echo $PASS | docker login -u $USER --password-stdin'
-                    sh 'docker push <your-dockerhub-username>/sample-app:latest'
-                }
-            }
-        }
-
-        stage('Run Container') {
-            steps {
-                sh 'docker stop sample-app || true && docker rm sample-app || true'
-                sh 'docker run -d --name sample-app -p 9090:8080 <your-dockerhub-username>/sample-app:latest'
-            }
-        }
+    stage('Build WAR') {
+      steps {
+        sh 'chmod +x mvnw || true'
+        sh './mvnw -v || mvn -v'
+        sh './mvnw clean package -DskipTests || mvn clean package -DskipTests'
+      }
     }
 
-    post {
-        always {
-            sh 'docker logout'
-        }
+    stage('Build Docker Image') {
+      steps {
+        sh 'DOCKER_BUILDKIT=1 docker build -t $DOCKERHUB_USER/$IMAGE_NAME:$IMAGE_TAG .'
+      }
     }
+
+    stage('Push to Docker Hub') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+          sh 'echo $PASS | docker login -u $USER --password-stdin'
+          sh 'docker push $DOCKERHUB_USER/$IMAGE_NAME:$IMAGE_TAG'
+        }
+      }
+    }
+
+    stage('Run Container') {
+      steps {
+        sh 'docker rm -f sample-app || true'
+        sh 'docker run -d --name sample-app -p 9090:8080 $DOCKERHUB_USER/$IMAGE_NAME:$IMAGE_TAG'
+      }
+    }
+  }
+
+  post {
+    always { sh 'docker logout || true' }
+  }
 }
 ```
 
-*(Replace `<your-username>` and `<your-dockerhub-username>` with your actual values.)*
+### 5.1 Create the Jenkins job
+- Jenkins → **New Item** → **Pipeline** → name it `sample-java-pipeline` → **OK**
+- **Pipeline** → **Definition:** *Pipeline script from SCM*
+  - **SCM:** Git
+  - **Repository URL:** `https://github.com/<your-username>/sample-java-application.git`
+  - **Credentials:** *(select `github` if private; otherwise leave blank)*
+  - **Branch Specifier:** `*/main`
+  - **Script Path:** `Jenkinsfile`
+- **Save** → **Build Now**
 
 ---
 
-## ✅ Verification
+## 6) Verify deployment
 
-1. Trigger the Jenkins job manually.
-2. Jenkins will:
-   - Clone the repo
-   - Build Docker image
-   - Push image to Docker Hub
-   - Run container
-3. Visit: `http://<your-server-ip>:9090`
+### 6.1 Check container
+```bash
+docker ps
+```
+Expected mapping: `0.0.0.0:9090->8080/tcp` with container name `sample-app`.
 
-You should see the Java application running! 🎉
+### 6.2 Test locally on the Jenkins host
+```bash
+curl -I http://localhost:9090/
+```
 
----
+### 6.3 Test from your browser
+Visit: `http://<jenkins-host-ip>:9090/app` (or the correct context path for your app)
 
-## 📌 Summary
-- Installed Git, Docker, Jenkins.
-- Forked a sample Java project.
-- Wrote a Dockerfile and tested locally.
-- Pushed Docker image to Docker Hub.
-- Automated everything via Jenkins pipeline.
-- Verified application running on port `9090`.
+> If unreachable, open firewall/security group for **TCP 9090** on the VM.
 
 ---
 
-### 🔗 References
-- [Docker Docs](https://docs.docker.com/)
-- [Jenkins Docs](https://www.jenkins.io/doc/)
-- [Sample Java Application](https://github.com/arjunpilakkal/sample-java-application)
+## 7) Troubleshooting (quick fixes)
+
+| Symptom / Error | Likely Cause | Fix |
+|---|---|---|
+| `permission denied while connecting to Docker daemon` | `jenkins` not in `docker` group | `sudo usermod -aG docker jenkins && sudo systemctl restart jenkins` |
+| `bind: address already in use :8080` | Jenkins uses 8080; port conflict | Map to another host port: `-p 9090:8080` (as in the pipeline) |
+| `unauthorized: access token has insufficient scopes` (docker push) | Docker Hub token is read-only | Create a **Read & Write** access token and update Jenkins credential `dockerhub` |
+| `repository does not exist or may require 'docker login'` | Not logged in or wrong repo name | Verify `docker login`, ensure repo path `$DOCKERHUB_USER/$IMAGE_NAME` is correct |
+| `404 Not Found` while downloading Tomcat | Version URL changed | Update Dockerfile to a current Tomcat (e.g., `9.0.108`) |
+| `./mvnw: not found` in Jenkins | Project missing Maven Wrapper | Install Maven on host (`sudo apt install -y maven`) and use `mvn` path in Jenkinsfile |
+| App not reachable from Internet | Firewall/Security Group closed | Open inbound TCP **9090** to your IP or 0.0.0.0/0 as appropriate |
+| Disk full during build | Docker layers piling up | `docker system prune -f` (careful!), add `.dockerignore` |
+
+---
+
+## 8) Extras & best practices
+- **Tag images per build** for rollbacks:
+  ```groovy
+  def tag = "${env.BUILD_NUMBER}"
+  sh 'docker tag $DOCKERHUB_USER/$IMAGE_NAME:latest $DOCKERHUB_USER/$IMAGE_NAME:' + tag
+  sh 'docker push $DOCKERHUB_USER/$IMAGE_NAME:' + tag
+  ```
+- **Run on port 80** (optional): `docker run -p 80:8080 ...` (ensure nothing else uses 80)
+- **Non-root in container** (hardening):
+  ```dockerfile
+  RUN useradd -m appuser && chown -R appuser:appuser /opt/tomcat
+  USER appuser
+  ```
+- **Healthcheck** example:
+  ```dockerfile
+  HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:8080/ || exit 1
+  ```
+- **Webhook trigger**: Configure a GitHub webhook to Jenkins URL `http://<jenkins-ip>:8080/github-webhook/` for auto-builds on push.
+
+---
+
+## 9) What to submit (typical assignment)
+- `README.md` (this file) in your fork
+- `Dockerfile` and `Jenkinsfile`
+- Screenshot of Jenkins **successful pipeline**
+- Screenshot of container from `docker ps`
+- Browser screenshot: `http://<ip>:9090/...` working
+
+---
+
+**You’re done!** You now have a reproducible pipeline that turns a Java web app into a Dockerized Tomcat service, built and shipped by Jenkins.
+
