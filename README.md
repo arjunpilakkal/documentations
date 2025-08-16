@@ -1,2 +1,2 @@
-# sonarqube
-A documentation on how to setup sonarqube and jenkins pipeline
+# Documentations
+Documentations for various devops concepts and mini projects
